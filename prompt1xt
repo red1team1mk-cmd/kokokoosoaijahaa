@@ -1,0 +1,17 @@
+This repo is a Python Telegram bot (python-telegram-bot v22) with an aiohttp Mini App (miniapp.py), Telethon/Pyrogram assistant account (admin_extras.py), and a SQLite DB. Prepare it to deploy on Railway as ONE service running `python bot.py`. Do the following, then show me a summary:
+
+1. Secrets: remove ALL hardcoded secrets from bot.py (BOT_TOKEN, OWNER_ID, ASSISTANT_API_ID, ASSISTANT_API_HASH, ASSISTANT_USERNAME, ASSISTANT_SESSION_STRING). Read them from environment variables with os.getenv. Exit with a clear error if BOT_TOKEN or OWNER_ID is missing. Never commit secrets; add a .env.example with empty values only.
+
+2. Port & URL: MINIAPP_PORT = int(os.getenv("PORT") or "8080"). MINIAPP_URL = os.getenv("MINIAPP_URL") or f"https://{RAILWAY_PUBLIC_DOMAIN}" if that var exists. The web server must bind 0.0.0.0.
+
+3. Tunnel: do NOT start cloudflared/ngrok when MINIAPP_URL is set. When MINIAPP_URL is set, call bot.set_chat_menu_button(MenuButtonWebApp(text="eye of hell", web_app=WebAppInfo(url=MINIAPP_URL))) on startup. Delete cloudflared.exe and run.bat from the repo.
+
+4. Database on a Railway Volume: DB_PATH = os.path.join(RAILWAY_VOLUME_MOUNT_PATH, "channel_manager.db") if that env var exists, else "channel_manager.db". The .miniapp_cache folder must live next to the DB (already derived from db_path in miniapp.py — keep it that way).
+
+5. Large file split: GitHub web upload rejects files >25MB. If channel_manager.db is in the repo, gzip it and split into parts under 20MB named channel_manager.db.gz.part00, part01, ... in the repo root. On startup, if DB_PATH does not exist, concatenate the parts in sorted order, gunzip, write to DB_PATH.tmp, then os.replace to DB_PATH. Remove the raw .db file from the repo.
+
+6. Files to add: requirements.txt (python-telegram-bot==22.8, Telethon==1.46.0, Pyrogram==2.0.106, TgCrypto==1.2.5, aiohttp==3.14.5, tzdata), railway.json with startCommand "python bot.py" and restartPolicyType ON_FAILURE, .python-version "3.11", and .gitignore (__pycache__, *.db, *.db-wal, *.db-shm, .miniapp_cache/, .env, *.exe).
+
+7. Verify: run `python -m pyflakes *.py` and fix real errors (undefined names, syntax). Do not refactor or change bot behavior beyond the above.
+
+8. At the end, give me the exact Railway steps: set the variables, attach a Volume at /data, Generate Domain on port 8080, redeploy.
