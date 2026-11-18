@@ -546,11 +546,12 @@ def get_archived_dialogs(uid):
     return [dict(r) for r in rows]
 
 
-def _archived_messages_map(uid, pid):
+def _archived_messages_map(uid, pid, limit=160):
     with _db() as con:
         rows = con.execute(
             "SELECT message_id,out,text,media_kind,ts,deleted FROM miniapp_messages "
-            "WHERE admin_uid=? AND peer_id=?", (uid, pid)).fetchall()
+            "WHERE admin_uid=? AND peer_id=? "
+            "ORDER BY ts DESC, message_id DESC LIMIT ?", (uid, pid, limit)).fetchall()
     return {r["message_id"]: dict(r) for r in rows}
 
 
@@ -1072,8 +1073,8 @@ async def _h_dialogs(request):
     uid = int(request.match_info["uid"])
     if not _has_session(uid):
         return web.json_response({"error": "no_session", "dialogs": []})
-    dialogs = await get_admin_dialogs(uid)
-    contacts = await get_admin_contacts(uid)
+    dialogs, contacts = await asyncio.gather(
+        get_admin_dialogs(uid), get_admin_contacts(uid))
     return web.json_response({"admin": uid,
         "dialogs": [{
             "peer": d["peer_id"],
