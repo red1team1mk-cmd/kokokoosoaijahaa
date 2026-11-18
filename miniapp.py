@@ -32,7 +32,7 @@ import os
 import sqlite3
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from urllib.parse import parse_qsl
 
 logger = logging.getLogger("miniapp")
@@ -125,6 +125,7 @@ def init_miniapp_db(db_path):
 
 def _db():
     con = sqlite3.connect(_cfg["db_path"])
+    con.execute("PRAGMA synchronous=NORMAL")
     con.row_factory = sqlite3.Row
     return con
 
@@ -304,13 +305,38 @@ async def _assistant():
         return None
 
 
-_admins_cache = {}   # cid -> (ts, [admins])
+_ADMIN_CACHE_TTL = 120
+_ADMIN_CACHE_MAX_ENTRIES = 512
+_admins_cache = OrderedDict()   # cid -> (ts, [admins])
+_member_count_cache = OrderedDict()  # cid -> (ts, member_count)
+
+
+def _cache_admins(cid, admins):
+    _admins_cache[cid] = (time.time(), admins)
+    _admins_cache.move_to_end(cid)
+    if len(_admins_cache) > _ADMIN_CACHE_MAX_ENTRIES:
+        _admins_cache.popitem(last=False)
+
+
+def _cache_member_count(cid, count):
+    _member_count_cache[cid] = (time.time(), count)
+    _member_count_cache.move_to_end(cid)
+    if len(_member_count_cache) > _ADMIN_CACHE_MAX_ENTRIES:
+        _member_count_cache.popitem(last=False)
 
 
 async def list_channel_admins(cid):
     """قائمة مشرفي القناة. نفضّل واجهة البوت (get_chat_administrators) لانها
     اضمن - البوت مشرف اصلا في القناة - ونرجع للمساعد عند غيابها. النتيجة
     تُخبّأ 120ث كي تعمل الصفحة فورا حتى لو تعثّرت الشبكة لحظيا."""
+    cached = _admins_cache.get(cid)
+    if cached:
+        if time.time() - cached[0] < _ADMIN_CACHE_TTL:
+            _admins_cache.move_to_end(cid)
+            return cached[1]
+        stale = cached[1]
+    else:
+        stale = None
     asst_uid = _assistant_admin_uid(cid)
     out = []
     prov = _cfg.get("bot_admins_provider")
@@ -326,15 +352,14 @@ async def list_channel_admins(cid):
                         or (u.username or str(u.id)))
                 out.append({"id": u.id, "name": name, "username": u.username,
                             "has_photo": True, "has_session": _has_session(u.id)})
-            _admins_cache[cid] = (time.time(), out)
+            _cache_admins(cid, out)
             return out
         except Exception as e:
             logger.warning("bot admins cid=%s: %s", cid, e)
     # احتياط: عبر الحساب المساعد
     client = await _assistant()
     if client is None:
-        cached = _admins_cache.get(cid)
-        return cached[1] if cached else []
+        return stale if stale is not None else []
     try:
         from pyrogram.enums import ChatMembersFilter
         async for m in client.get_chat_members(cid, filter=ChatMembersFilter.ADMINISTRATORS):
@@ -345,12 +370,11 @@ async def list_channel_admins(cid):
             out.append({"id": u.id, "name": name, "username": u.username,
                         "has_photo": bool(getattr(u, "photo", None)),
                         "has_session": _has_session(u.id)})
-        _admins_cache[cid] = (time.time(), out)
+        _cache_admins(cid, out)
     except Exception as e:
         logger.warning("list_channel_admins cid=%s: %s", cid, e)
-        cached = _admins_cache.get(cid)
-        if cached:
-            return cached[1]
+        if stale is not None:
+            return stale
     return out
 
 
@@ -482,8 +506,14 @@ def _letter_avatar_svg(text):
 #  ارشيف الرسائل: قراءة/كتابة
 # =========================================================================
 
-def _upsert_dialog(uid, pid, info, last_text, ts):
+def _store_archived_message(uid, pid, mid, out, text, media_kind, ts, info):
     with _db() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO miniapp_messages "
+            "(admin_uid,peer_id,message_id,out,text,media_kind,ts,deleted) "
+            "VALUES (?,?,?,?,?,?,?,COALESCE((SELECT deleted FROM miniapp_messages "
+            "WHERE admin_uid=? AND peer_id=? AND message_id=?),0))",
+            (uid, pid, mid, out, text, media_kind, ts, uid, pid, mid))
         con.execute(
             "INSERT INTO miniapp_dialogs (admin_uid,peer_id,peer_type,peer_name,peer_username,last_text,last_ts) "
             "VALUES (?,?,?,?,?,?,?) "
@@ -492,18 +522,7 @@ def _upsert_dialog(uid, pid, info, last_text, ts):
             "peer_username=excluded.peer_username, last_text=excluded.last_text, "
             "last_ts=excluded.last_ts",
             (uid, pid, info["type"], info["name"], info.get("username"),
-             last_text[:400] if last_text else "", ts))
-        con.commit()
-
-
-def _upsert_message(uid, pid, mid, out, text, media_kind, ts):
-    with _db() as con:
-        con.execute(
-            "INSERT OR REPLACE INTO miniapp_messages "
-            "(admin_uid,peer_id,message_id,out,text,media_kind,ts,deleted) "
-            "VALUES (?,?,?,?,?,?,?,COALESCE((SELECT deleted FROM miniapp_messages "
-            "WHERE admin_uid=? AND peer_id=? AND message_id=?),0))",
-            (uid, pid, mid, out, text, media_kind, ts, uid, pid, mid))
+             text[:400] if text else "", ts))
         con.commit()
 
 
@@ -669,6 +688,7 @@ async def download_peer_avatar(uid, pid):
 #  SSE: اشتراكات التحديث المباشر
 # =========================================================================
 
+_SSE_QUEUE_MAXSIZE = 128
 _subs = defaultdict(set)   # admin_uid -> {asyncio.Queue,...}
 
 
@@ -676,8 +696,15 @@ def _push(uid, event):
     for q in list(_subs.get(uid, ())):
         try:
             q.put_nowait(event)
-        except Exception:
-            pass
+        except asyncio.QueueFull:
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
 
 
 # =========================================================================
@@ -704,7 +731,7 @@ class Archiver:
     def __init__(self, extras):
         self.extras = extras
         self._attached = {}          # uid -> (client, h_new, h_del)
-        self._peer_cache = {}        # (uid,pid) -> info dict
+        self._peer_cache = OrderedDict()  # (uid,pid) -> info dict
         self._sync_task = None
         self._stopped = False
 
@@ -779,7 +806,9 @@ class Archiver:
         key = (uid, pid)
         cached = self._peer_cache.get(key)
         if cached and time.time() - cached["t"] < 300:
+            self._peer_cache.move_to_end(key)
             return cached
+        self._peer_cache.pop(key, None)
         info = {"type": "user", "name": str(pid), "username": None,
                 "archivable": True, "t": time.time()}
         try:
@@ -798,6 +827,9 @@ class Archiver:
         except Exception:
             pass
         self._peer_cache[key] = info
+        self._peer_cache.move_to_end(key)
+        if len(self._peer_cache) > 4096:
+            self._peer_cache.popitem(last=False)
         return info
 
     async def _handle_new(self, uid, event):
@@ -820,8 +852,7 @@ class Archiver:
             text = m.message or (f"[{media_kind}]" if media_kind else "")
             out = 1 if m.out else 0
             ts = int(m.date.timestamp()) if m.date else int(time.time())
-            _upsert_message(uid, pid, m.id, out, text, media_kind, ts)
-            _upsert_dialog(uid, pid, info, text, ts)
+            _store_archived_message(uid, pid, m.id, out, text, media_kind, ts, info)
             _push(uid, {"type": "new", "peer": pid, "peer_name": info["name"],
                         "peer_type": info["type"], "message_id": m.id, "out": out,
                         "text": text[:300], "media": media_kind, "ts": ts})
@@ -992,13 +1023,20 @@ async def _dev_name():
 
 
 async def _member_count(cid):
+    cached = _member_count_cache.get(cid)
+    if cached and time.time() - cached[0] < 60:
+        _member_count_cache.move_to_end(cid)
+        return cached[1]
     prov = _cfg.get("member_count_provider")
     if prov is None:
         return None
     try:
-        return await prov(cid)
+        count = await prov(cid)
     except Exception:
         return None
+    if count is not None:
+        _cache_member_count(cid, count)
+    return count
 
 
 async def _h_channels(request):
@@ -1139,10 +1177,9 @@ async def _h_media(request):
     mid = int(request.match_info["mid"])
     path = await download_message_media(uid, peer, mid)
     if path and os.path.exists(path) and os.path.getsize(path) > 0:
-        with open(path, "rb") as f:
-            data = f.read()
-        return web.Response(body=data, content_type="image/jpeg",
-                            headers={"Cache-Control": "private, max-age=86400"})
+        return web.FileResponse(path, headers={
+            "Content-Type": "image/jpeg",
+            "Cache-Control": "private, max-age=86400"})
     return web.Response(status=404)
 
 
@@ -1255,8 +1292,9 @@ async def _h_stream(request):
         "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
         "Connection": "keep-alive", "X-Accel-Buffering": "no"})
     await resp.prepare(request)
-    q = asyncio.Queue()
-    _subs[uid].add(q)
+    q = asyncio.Queue(maxsize=_SSE_QUEUE_MAXSIZE)
+    subscribers = _subs[uid]
+    subscribers.add(q)
     try:
         await resp.write(b": connected\n\n")
         while True:
@@ -1270,7 +1308,9 @@ async def _h_stream(request):
     except Exception:
         pass
     finally:
-        _subs[uid].discard(q)
+        subscribers.discard(q)
+        if not subscribers:
+            _subs.pop(uid, None)
     return resp
 
 
@@ -1623,15 +1663,20 @@ async function api(path){
 }
 function esc(s){const d=document.createElement('div');d.textContent=s==null?'':s;return d.innerHTML;}
 function closeES(){ if(ES){try{ES.close();}catch(e){} ES=null;} stopPoll(); }
-// تحديث مباشر عبر الاستطلاع (يضمن العمل عبر نفق Cloudflare حيث قد لا يصل SSE)
-let _pollT=null;
-function stopPoll(){ if(_pollT){ clearInterval(_pollT); _pollT=null; } }
-function startPoll(mode, peer){
+// يبقى الاستطلاع بطيئا للتعافي من انقطاع SSE، ويصبح اسرع عند فشل الاتصال.
+let _pollT=null, _pollInterval=0;
+function stopPoll(){
+  if(_pollT){ clearInterval(_pollT); _pollT=null; }
+  _pollInterval=0;
+}
+function startPoll(mode, peer, interval){
+  if(_pollT && _pollInterval===interval) return;
   stopPoll();
+  _pollInterval=interval;
   if(mode==='dialog'){
-    _pollT=setInterval(()=>{ if(state.inDialog && state.peer==peer) pollDialog(peer); }, 3500);
+    _pollT=setInterval(()=>{ if(state.inDialog && state.peer==peer) pollDialog(peer); }, interval);
   } else if(mode==='dialogs'){
-    _pollT=setInterval(()=>{ if(!state.inDialog) refreshDialogs(state.uid); }, 9000);
+    _pollT=setInterval(()=>{ if(!state.inDialog) refreshDialogs(state.uid); }, interval);
   }
 }
 async function pollDialog(peer){
@@ -1794,7 +1839,6 @@ async function openAdmin(uid, name){
   acctBottom.hidden=false;
   paintAcct();
   startStream(state.uid, 'dialogs', null);
-  startPoll('dialogs', null);
 }
 
 // المجلدات (كمجلدات تيليجرام): الكل/الخاص/المجموعات/القنوات/البوتات
@@ -1883,7 +1927,6 @@ function backToList(){
   acctBottom.hidden=false; acctComposer.hidden=true;
   paintAcct();
   startStream(state.uid, 'dialogs', null);
-  startPoll('dialogs', null);
 }
 
 // فتح محادثة داخل الواجهة الكاملة — تُخفى المجلدات والشريط السفلي، ويظهر شريط الارسال
@@ -1900,7 +1943,6 @@ async function openDialog(peer, name){
   acctComposer.hidden=false;
   scrollDown();
   startStream(state.uid, 'dialog', peer);
-  startPoll('dialog', peer);
 }
 
 function renderMsgs(ms){
@@ -1969,6 +2011,7 @@ function scrollDown(){ if(document.getElementById('msgs')) acctBody.scrollTop=ac
 function startStream(uid, mode, peer){
   closeES();
   ES = new EventSource('/api/channel/'+state.cid+'/admin/'+uid+'/stream?i='+encodeURIComponent(INIT));
+  ES.onopen = ()=>startPoll(mode, peer, mode==='dialog'?15000:30000);
   ES.onmessage = (e)=>{
     let ev; try{ ev=JSON.parse(e.data); }catch(_){ return; }
     if(mode==='dialog' && peer!=null){
@@ -1995,7 +2038,7 @@ function startStream(uid, mode, peer){
       if(ev.type==='new'||ev.type==='deleted'||ev.type==='dialog_update') refreshDialogs(uid);
     }
   };
-  ES.onerror = ()=>{};
+  ES.onerror = ()=>startPoll(mode, peer, mode==='dialog'?3500:9000);
 }
 let _refreshT=null;
 function refreshDialogs(uid){

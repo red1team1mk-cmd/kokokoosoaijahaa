@@ -96,9 +96,7 @@ class _SessionDB:
         self.path = db_path
 
     def _conn(self):
-        conn = sqlite3.connect(self.path)
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+        return sqlite3.connect(self.path)
 
     def save(self, uid, cid, session_string, phone, added_by):
         with self._conn() as c:

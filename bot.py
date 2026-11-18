@@ -7,7 +7,7 @@ import logging
 import re
 import sqlite3
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -59,6 +59,7 @@ BAN_LIMIT_WINDOW = 30
 RESTORE_CHUNK_SIZE = 5
 RESTORE_CHUNK_DELAY = 1.5
 MAINTENANCE_INTERVAL = 6 * 3600
+TRACKER_CLEANUP_INTERVAL = 5 * 60
 ADMIN_SYNC_INTERVAL = 15 * 60
 SESSION_MONITOR_INTERVAL = 30   # فحص شبه فوري: هل اخرج مشرف جلسة البوت من (اجهزة حسابه)؟
 MESSAGE_CACHE_MAX_AGE = 7 * 86400
@@ -284,21 +285,27 @@ def init_db():
 
 
 class TimedCache:
+    _max_entries = 10_000
+
     def __init__(self, ttl=30):
         self._ttl = ttl
-        self._data = {}
+        self._data = OrderedDict()
 
     def get(self, key, default=None):
         now = time.time()
         if key in self._data:
             val, exp = self._data[key]
             if now < exp:
+                self._data.move_to_end(key)
                 return val
             del self._data[key]
         return default
 
     def set(self, key, val, ttl=None):
         self._data[key] = (val, time.time() + (ttl or self._ttl))
+        self._data.move_to_end(key)
+        if len(self._data) > self._max_entries:
+            self._data.popitem(last=False)
 
     def delete(self, key):
         self._data.pop(key, None)
@@ -324,7 +331,6 @@ _cache = TimedCache(30)
 
 def _db():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
@@ -997,8 +1003,10 @@ class SpamTracker:
 
     def purge_empty(self):
         for d in (self._media, self._anon):
-            for k in [k for k, dq in d.items() if not dq]:
-                del d[k]
+            for key, dq in list(d.items()):
+                self._clean(dq, MEDIA_SPAM_WINDOW)
+                if not dq:
+                    del d[key]
 
 
 spam = SpamTracker()
@@ -1025,14 +1033,27 @@ class BanTracker:
         self._bans.pop((uid, cid), None)
 
     def purge_empty(self):
-        for k in [k for k, dq in self._bans.items() if not dq]:
-            del self._bans[k]
+        cutoff = time.time() - BAN_LIMIT_WINDOW
+        for key, dq in list(self._bans.items()):
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            if not dq:
+                del self._bans[key]
 
 
 ban_tracker = BanTracker()
 
 
-msg_media_cache = {}
+MESSAGE_MEDIA_CACHE_MAX_ENTRIES = 10_000
+msg_media_cache = OrderedDict()
+
+
+def _remember_message_media(cid, msg_id, value):
+    key = (cid, msg_id)
+    msg_media_cache[key] = value
+    msg_media_cache.move_to_end(key)
+    if len(msg_media_cache) > MESSAGE_MEDIA_CACHE_MAX_ENTRIES:
+        msg_media_cache.popitem(last=False)
 
 def ts_fmt(ts=None):
     dt = datetime.fromtimestamp(ts or time.time(), tz=_BAGHDAD)
@@ -1068,7 +1089,7 @@ def get_msg_file_uid(msg):
 def cache_msg(cid, msg_id, msg):
     fuid = get_msg_file_uid(msg)
     val = fuid if fuid else _TEXT
-    msg_media_cache[(cid, msg_id)] = val
+    _remember_message_media(cid, msg_id, val)
     DB.cache_message(cid, msg_id, fuid)
 
 
@@ -3591,7 +3612,10 @@ async def monitor_edit(update, ctx):
         ban_items = DB.get_ban_items(cid) if bans.get("custom") else []
         violation = check_ban_violations(msg, bans, ban_items)
 
-    cached_val = msg_media_cache.get((cid, msg.message_id))
+    cache_key = (cid, msg.message_id)
+    cached_val = msg_media_cache.get(cache_key)
+    if cached_val is not None:
+        msg_media_cache.move_to_end(cache_key)
     if cached_val is None:
         cached_val = DB.get_cached_message(cid, msg.message_id)
     new = get_msg_file_uid(msg)
@@ -3712,17 +3736,21 @@ async def monitor_member_update(update, ctx):
 
 
 async def _maintenance_loop():
+    next_db_cleanup = time.monotonic() + MAINTENANCE_INTERVAL
     while True:
         try:
-            await asyncio.sleep(MAINTENANCE_INTERVAL)
+            await asyncio.sleep(TRACKER_CLEANUP_INTERVAL)
+            spam.purge_empty()
+            ban_tracker.purge_empty()
+            if time.monotonic() < next_db_cleanup:
+                continue
             DB.prune_message_cache(MESSAGE_CACHE_MAX_AGE)
             DB.prune_spam_log(SPAM_LOG_MAX_AGE)
             if msg_media_cache:
                 msg_media_cache.clear()
             purged = _cache.purge_expired()
-            spam.purge_empty()
-            ban_tracker.purge_empty()
             logger.info(f"maintenance: pruned message_cache, spam_log, {purged} cache entries, and empty spam/ban/flood trackers")
+            next_db_cleanup = time.monotonic() + MAINTENANCE_INTERVAL
         except asyncio.CancelledError:
             raise
         except Exception as e:
