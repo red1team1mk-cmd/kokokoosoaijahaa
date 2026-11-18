@@ -1,0 +1,6 @@
+python-telegram-bot==22.8
+Telethon==1.46.0
+Pyrogram==2.0.106
+TgCrypto==1.2.5
+aiohttp==3.14.5
+tzdata
