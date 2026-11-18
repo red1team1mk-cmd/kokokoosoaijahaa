@@ -162,12 +162,24 @@ def get_stats(uid):
                 edits = r[0] if r else 0
             except Exception:
                 edits = 0
-        try:
-            archived = con.execute("SELECT COUNT(*) FROM miniapp_messages").fetchone()[0]
-        except Exception:
-            archived = 0
+        archived = _get_archived_message_count(con)
     return {"channels": len(cids), "violations": viol,
             "edits_deleted": edits, "archived": archived}
+
+
+_archived_count_cache = {"count": 0, "ts": 0}
+
+
+def _get_archived_message_count(con):
+    now = time.time()
+    if now - _archived_count_cache["ts"] >= 30:
+        try:
+            _archived_count_cache["count"] = con.execute(
+                "SELECT COUNT(*) FROM miniapp_messages").fetchone()[0]
+            _archived_count_cache["ts"] = now
+        except sqlite3.Error:
+            logger.exception("count archived messages")
+    return _archived_count_cache["count"]
 
 
 def get_channel_stats(cid):
@@ -994,7 +1006,9 @@ async def download_own_avatar(uid):
 # =========================================================================
 
 async def _h_index(request):
-    return web.Response(text=INDEX_HTML, content_type="text/html", charset="utf-8")
+    response = web.Response(text=INDEX_HTML, content_type="text/html", charset="utf-8")
+    response.enable_compression()
+    return response
 
 
 async def _h_health(request):
@@ -1002,24 +1016,32 @@ async def _h_health(request):
 
 
 _dev_name_cache = {"name": None, "ts": 0}
+_dev_name_refresh_task = None
+
+
+async def _refresh_dev_name():
+    global _dev_name_refresh_task
+    prov = _cfg.get("owner_name_provider")
+    try:
+        nm = await prov() if prov is not None else None
+        if nm:
+            _dev_name_cache["name"] = nm
+            _dev_name_cache["ts"] = time.time()
+    except Exception as e:
+        logger.warning("dev name: %s", e)
+    finally:
+        _dev_name_refresh_task = None
 
 
 async def _dev_name():
-    """اسم المطوّر = اسم المالك الحالي في تيليجرام (ثابت لكل المستخدمين, يتحدّث تلقائيا)."""
+    """Return a cached name immediately and refresh it without delaying the page."""
+    global _dev_name_refresh_task
     prov = _cfg.get("owner_name_provider")
-    if prov is None:
-        return _dev_name_cache["name"]
     now = time.time()
-    if _dev_name_cache["name"] and (now - _dev_name_cache["ts"] < 120):
-        return _dev_name_cache["name"]
-    try:
-        nm = await prov()
-        if nm:
-            _dev_name_cache["name"] = nm
-            _dev_name_cache["ts"] = now
-    except Exception as e:
-        logger.warning("dev name: %s", e)
-    return _dev_name_cache["name"]
+    if prov is not None and now - _dev_name_cache["ts"] >= 120:
+        if _dev_name_refresh_task is None:
+            _dev_name_refresh_task = asyncio.create_task(_refresh_dev_name())
+    return _dev_name_cache["name"] or "eye of hell"
 
 
 async def _member_count(cid):
@@ -1400,7 +1422,9 @@ INDEX_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>eye of hell</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://telegram.org" crossorigin>
+<script async src="https://telegram.org/js/telegram-web-app.js"
+ onload="window.dispatchEvent(new Event('telegram-web-app-loaded'))"></script>
 <style>
   :root{
     --bg:#080607; --bg2:#141012; --card:#1c1113; --card2:#241416;
@@ -1599,6 +1623,9 @@ INDEX_HTML = r"""<!doctype html>
     font-size:9.5px;font-weight:800;border-radius:6px;padding:1px 6px}
   .devname{color:var(--fg);font-size:12.5px;font-weight:700;white-space:nowrap;
     overflow:hidden;text-overflow:ellipsis}
+  .wrap::after,.acct-body::after{content:"Dev By Muhnad - Powered By KroTheCommander";
+    display:block;text-align:center;color:var(--muted);font-size:11px;
+    letter-spacing:.2px;padding:18px 4px 10px;opacity:.8}
   /* لابتوب/شاشات واسعة */
   @media (min-width:820px){
     body{font-size:15.5px}
@@ -1649,9 +1676,9 @@ INDEX_HTML = r"""<!doctype html>
 </div>
 <div class="lightbox" id="lightbox" hidden onclick="closeImg()"><img id="lightboxImg" alt=""></div>
 <script>
-const TG = window.Telegram ? window.Telegram.WebApp : null;
-if(TG){try{TG.ready();TG.expand();}catch(e){}}
-const INIT = TG ? TG.initData : "";
+let TG = null;
+let INIT = "";
+let _appStarted = false;
 const view = document.getElementById('view');
 const whoami = document.getElementById('whoami');
 let ES = null;
@@ -2051,6 +2078,24 @@ function refreshDialogs(uid){
   }, 600);
 }
 
+function bootMiniApp(){
+  if(_appStarted) return;
+  _appStarted=true;
+  TG = window.Telegram ? window.Telegram.WebApp : null;
+  INIT = TG ? TG.initData : "";
+  if(!INIT){
+    view.innerHTML='<div class="err">افتح التطبيق من داخل تيليجرام.</div>';
+    return;
+  }
+  try{ TG.ready(); TG.expand(); }catch(e){}
+  loadChannels();
+}
+window.addEventListener('telegram-web-app-loaded', bootMiniApp, {once:true});
+if(window.Telegram) bootMiniApp();
+setTimeout(()=>{
+  if(!_appStarted) view.innerHTML='<div class="err">تعذّر تحميل التطبيق. تحقق من اتصال الإنترنت ثم أعد فتحه.</div>';
+}, 5000);
+
 (function(){
   const inp=document.getElementById('cinput');
   if(!inp) return;
@@ -2061,7 +2106,6 @@ function refreshDialogs(uid){
   });
 })();
 
-loadChannels();
 </script>
 </body>
 </html>
