@@ -37,9 +37,10 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 ASSISTANT_API_ID = int(os.getenv("ASSISTANT_API_ID", "0") or 0)
 ASSISTANT_USERNAME = os.getenv("ASSISTANT_USERNAME", "")
 MINIAPP_ENABLED = os.getenv("MINIAPP_ENABLED", "1") == "1"
-MINIAPP_PORT = int(os.getenv("PORT") or os.getenv("MINIAPP_PORT") or "8080")  # Railway يعطي PORT
+MINIAPP_PORT = int(os.getenv("PORT") or "8080")
+RAILWAY_PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN")
 MINIAPP_URL = os.getenv("MINIAPP_URL", "").strip() or (
-    f"https://{os.getenv('RAILWAY_PUBLIC_DOMAIN')}" if os.getenv("RAILWAY_PUBLIC_DOMAIN") else "")
+    f"https://{RAILWAY_PUBLIC_DOMAIN}" if RAILWAY_PUBLIC_DOMAIN else "")
 ASSISTANT_API_HASH = os.getenv("ASSISTANT_API_HASH", "").strip()
 ASSISTANT_SESSION_STRING = os.getenv("ASSISTANT_SESSION_STRING", "").strip()
 
